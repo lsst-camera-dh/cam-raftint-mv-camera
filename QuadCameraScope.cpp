@@ -40,7 +40,7 @@ int g_mosaic_tile[]={2,2};
 char **g_serials;
 int g_ncameras=0;
 long g_expotime=200000;
-char g_lvl=0;
+char g_lvl=00;
 /******************
 end of globals
 ******************/
