@@ -539,7 +539,7 @@ void stash_results (Request* thisreq, Device *pDev) {
 	while (i--) {
 	  int x=startx+(i%iWidth)/g_mosaic_rebin;
 	  int y=starty+(i/iWidth)/g_mosaic_rebin;
-	  g_pMosaic[y*g_mosaicNX+x]+=((char*)(pData))[i];
+	  g_pMosaic[y*g_mosaicNX+x] += (0xFF & ((char*)(pData))[i]);
 	}
 	// save the mosaic if appropriate (do this only for a specific camera index case
 	if (camera_index==0) {
@@ -559,7 +559,7 @@ void stash_results (Request* thisreq, Device *pDev) {
 	  if (status) fits_report_error(status);
 	  long naxis=2;
 	  long naxes[]={(long)g_mosaicNX,(long)g_mosaicNY};
-	  fits_create_img(ff,SHORT_IMG,naxis,naxes,&status);
+	  fits_create_img(ff,USHORT_IMG,naxis,naxes,&status);
 	  if (status) fits_report_error(status);
 	  fits_write_img(ff,TUINT,1,naxes[0]*naxes[1],(void*)mosaic_copy,&status);
 	  if (status) fits_report_error(status);
@@ -697,14 +697,23 @@ void stash_results (Request* thisreq, Device *pDev) {
     if (g_save_rebin!=0) { 
       // save another representation of the image, 
       // this time decimated by g_save_rebin x g_save_rebin for smaller size
+
       char outfile_rebin[1024];
-      sprintf(outfile_rebin,"dat/BF_%s_rb%02d_%u_%u.fits",
-	      ser.c_str(),g_save_rebin,ts,xt);
+
+      if (g_decimate) {
+	sprintf(outfile_rebin,"dat/BF_%s_dm%02d_%u_%u.fits",
+		ser.c_str(),g_save_rebin,ts,xt);
+      } else {
+	sprintf(outfile_rebin,"dat/BF_%s_rb%02d_%u_%u.fits",
+		ser.c_str(),g_save_rebin,ts,xt);
+      }
+
       int status=0;
       fitsfile *ff;
 
       if (g_verbose)
 	cout << " (" << outfile_rebin << ") " << endl;
+
       fits_create_file(&ff,outfile_rebin,&status);
       if (status) fits_report_error(status);
 
@@ -744,7 +753,7 @@ void stash_results (Request* thisreq, Device *pDev) {
 	    i=(ix%iWidth)/g_save_rebin;
 	    j=(ix/iWidth)/g_save_rebin;
 	    //	    cout << "orig_x,y = " << ix%iWidth << "," << ix/iWidth << "rebin_x,y = " << i << "," << j << endl;
-	    pData_rebin[j*naxes[0]+i] += ((char*)(pData))[ix];
+	    pData_rebin[j*naxes[0]+i] += (0xFF & ((char*)(pData))[ix]);
 	  }
 	  fits_create_img(ff,USHORT_IMG,naxis,naxes,&status);
 	  if (status) fits_report_error(status);
