@@ -28,8 +28,17 @@ globals for use in coordinating results from 4 cameras
 ******************/
 int g_verbose=0;
 int g_save_raw=0;
+unsigned short **g_stacked_image;
+char **g_normal_image;
+unsigned short **g_pix_Xlut;
+unsigned short **g_pix_Ylut;
+int *g_stacked_frame_ix;
+int g_savestack_nth_frame=0;
 int g_save_rebin=0;
 int g_save_mosaic=0;
+int g_device_map[]={1,0,3,2};
+int g_device_flip_x[]={0,0,0,0};
+int g_device_flip_y[]={1,1,1,1};
 int g_pLock=0;
 unsigned int *g_pMosaic=NULL;
 int g_decimate=0;
@@ -315,6 +324,7 @@ int main( int argc, char* argv[] )
       {{"verbose", no_argument,       &g_verbose,      1},
        {"decimate",no_argument,       &g_decimate,     1},
        {"bin",     required_argument, 0,             'b'},
+       {"stack",   required_argument, 0,             'S'},
        {"expoauto",required_argument, 0,             'a'},
        {"expotime",required_argument, 0,             'x'},
        {"save_raw",no_argument,       0,             's'},
@@ -343,6 +353,11 @@ int main( int argc, char* argv[] )
     case 'x':
       printf("option -x (expotime) with value `%s'\n",optarg);
       sscanf(optarg,"%ld",&g_expotime);
+      break;
+
+    case 'S':
+      printf("option -S (stack) with value `%s'\n",optarg);
+      sscanf(optarg,"%d",&g_savestack_nth_frame);
       break;
 
     case 'b':
@@ -417,15 +432,54 @@ int main( int argc, char* argv[] )
   { // set up some globals for coordinated output
     g_ncameras=devCnt;
     g_serials=(char**)malloc(g_ncameras*sizeof(char*));
+
+    if (g_serials==NULL) {
+      cout << "can't allocate! gserials -- exiting." 
+	   << endl; 
+      exit(1);
+    }
+    g_normal_image=(char **)malloc(g_ncameras*sizeof(char*));
+    if (g_normal_image==NULL) {
+      cout << "can't allocate! g_normal_image -- exiting." 
+	   << endl; 
+      exit(1);
+    }
+    g_pix_Xlut=(unsigned short**)malloc(g_ncameras*sizeof(unsigned short*));
+    g_pix_Ylut=(unsigned short**)malloc(g_ncameras*sizeof(unsigned short*));
+    if ((g_pix_Xlut==NULL) || (g_pix_Ylut==NULL)) {
+      cout << "can't allocate! g_pix_*lut -- exiting." 
+	   << endl; 
+      exit(1);
+    }
+    
+
+    if (g_savestack_nth_frame != 0) {
+      g_stacked_image=(unsigned short**)
+	malloc(g_ncameras*sizeof(unsigned short*));
+      if (g_stacked_image==NULL) {
+	cout << "can't allocate! g_stacked_image -- exiting." 
+	     << endl; 
+	exit(1);
+      }
+      g_stacked_frame_ix=(int*)malloc(g_ncameras*sizeof(int));
+    }
+
     for (int j=0;j<g_ncameras;j++) {
+      g_normal_image[j]=NULL;
+      g_pix_Xlut[j]=g_pix_Ylut[j]=NULL;
       g_serials[j]=(char*)malloc(1024*sizeof(char));
+      if (g_serials[j]==NULL) {
+	cout << "can't allocate! gserials[j] -- exiting." << endl;
+	exit(1);
+      }
+      if (g_savestack_nth_frame) {
+	g_stacked_image[j]=NULL; // g_stacked_image allocated below
+	g_stacked_frame_ix[j]=0;
+      }
     }
     g_mosaic_tile[1] = ceil(g_ncameras / g_mosaic_tile[0]);
-    for( unsigned int i = 0; i < devCnt; i++ )
-      {
-	// populate globals for use later
-	sprintf(g_serials[i],devMgr[i]->serial.read().c_str());
-      }
+    for( unsigned int i = 0; i < devCnt; i++ )	// populate globals for use later
+      sprintf(g_serials[i],devMgr[i]->serial.read().c_str());
   }
 
   
@@ -473,7 +527,7 @@ int main( int argc, char* argv[] )
 }
 
 void stash_results (Request* thisreq, Device *pDev) {
-
+  
   if (thisreq->isOK()) {
     unsigned int ts = thisreq->infoTimeStamp_us.read();
     unsigned int xt = thisreq->infoExposeTime_us.read();
@@ -483,18 +537,103 @@ void stash_results (Request* thisreq, Device *pDev) {
     unsigned int iWidth = thisreq->imageWidthTotal.read();
     unsigned int iHeight = thisreq->imageHeightTotal.read();
     unsigned int npix=iWidth*iHeight;
+    int camera_index=g_ncameras;
+
+    while (camera_index-- && strcmp(g_serials[camera_index],pDev->serial.read().c_str()));
+    // and use the mapping..
+    camera_index=g_device_map[camera_index];
+    
+    if (g_normal_image[camera_index]==NULL) {
+      g_normal_image[camera_index]=(char*)malloc(iWidth*iHeight*sizeof(char));
+      if (g_normal_image[camera_index]==NULL) {
+	cout << "can't allocate! g_normal_image[camera_index] -- exiting." << endl; 
+	exit(1);
+      }
+      g_pix_Xlut[camera_index]=(unsigned short*)malloc(iWidth*sizeof(unsigned short));
+      g_pix_Ylut[camera_index]=(unsigned short*)malloc(iHeight*sizeof(unsigned short));
+      if ((g_pix_Xlut[camera_index]==NULL) || (g_pix_Ylut[camera_index]==NULL)) {
+	cout << "can't allocate! g_pix_*lut[camera_index] -- exiting." << endl; 
+	exit(1);
+      }
+      // prepare reference array (map) to correct mapping for
+      // ds9 display etc. (using g_device_flip_x[] and g_device_flip_y[].
+      // here fill in the g_pix_addr_map for mapping incoming pixels.
+      int i;
+      i=iWidth;
+      while (i--)
+	g_pix_Xlut[camera_index][(g_device_flip_x[camera_index])?iWidth-1-i:i]=i;
+      i=iHeight;
+      while (i--)
+	g_pix_Ylut[camera_index][(g_device_flip_y[camera_index])?iHeight-1-i:i]=i;
+
+    } // won't deallocate this buffer. on subroutine exit, will use throughout program
+
+    {
+      int i=iWidth*iHeight;
+      char *d=g_normal_image[camera_index];
+      unsigned short *xlut=g_pix_Xlut[camera_index];
+      unsigned short *ylut=g_pix_Ylut[camera_index];
+      while (i--) 
+	d[ylut[i/iWidth]*iWidth+xlut[i%iWidth]]=pData[i];
+      pData=d;
+    }
+    
+    if ((g_savestack_nth_frame != 0) && 
+	(g_stacked_image[camera_index]==NULL)) {
+      g_stacked_image[camera_index]=
+	(unsigned short*)malloc(iWidth*iHeight*
+				sizeof(unsigned short));
+      if (g_stacked_image[camera_index]==NULL) {
+	cout << "can't allocate! g_stacked_image[camera_index] -- exiting." << endl; 
+	exit(1);
+      }
+      int i=iWidth*iHeight;
+      // initialize
+      while (i--) g_stacked_image[camera_index][i]=0; 
+    }
+    
+    if (g_savestack_nth_frame != 0) {
+      int i=iWidth*iHeight;
+      while (i--) {
+	g_stacked_image[camera_index][i] += 
+	  (unsigned short)(0xFF & pData[i]);
+      }
+      g_stacked_frame_ix[camera_index]++;
+      if (g_stacked_frame_ix[camera_index] % g_savestack_nth_frame == 0) {
+	char outfile_stack[1024];
+	sprintf(outfile_stack,"dat/BF_%s_stack%02d_%u_%u.fits",
+		ser.c_str(),g_savestack_nth_frame,ts,xt);
+	// save the image and zero it out again.
+	int status=0;
+	fitsfile *ff;
+	if (g_verbose)
+	  cout << " (" << outfile_stack << ") " << endl;
+	fits_create_file(&ff,outfile_stack,&status);
+	if (status) fits_report_error(status);
+	long naxis=2;
+	long naxes[]={(long)iWidth,(long)iHeight};
+	fits_create_img(ff,USHORT_IMG,naxis,naxes,&status);
+	if (status) fits_report_error(status);
+	fits_write_img(ff,TUSHORT,1,naxes[0]*naxes[1],
+		       (void*)g_stacked_image[camera_index],
+		       &status);
+	if (status) fits_report_error(status);
+	fits_close_file(ff,&status);
+	if (status) fits_report_error(status);
+	i=iWidth*iHeight;
+	while (i--) g_stacked_image[camera_index][i] = 0;
+      }
+    }
 
     if (g_save_mosaic) {
       // figure out which sensor this is (by serial) to determine its place
-      int camera_index=g_ncameras;
-      while (camera_index-- && strcmp(g_serials[camera_index],pDev->serial.read().c_str()));
       if (g_verbose)
 	cout << "got camera index: " << camera_index << endl;
       // initialize if necessary, using g_pLock etc.
       while (g_pLock) {
 	// do nothing until lock is released
-	if (g_verbose)
-	  cout << " waiting .. (camera_index=" << camera_index << ")";
+	//	if (g_verbose)
+	//	  cout << " waiting .. (camera_index=" << camera_index << ")";
 	usleep(30);
       }
       if (g_pMosaic==NULL) {
@@ -505,6 +644,8 @@ void stash_results (Request* thisreq, Device *pDev) {
 	g_mosaicNX=g_mosaic_tile[0]*(iWidth/g_mosaic_rebin);
 	g_mosaicNY=g_mosaic_tile[1]*(iHeight/g_mosaic_rebin);
 	g_pMosaic=(unsigned int*)malloc(g_mosaicNX*g_mosaicNY*sizeof(unsigned int));
+	if (g_pMosaic==NULL) {cout << "can't allocate! g_pMosaic -- exiting." << endl; 
+	  exit(1);}
 	g_pLock=0;
 	if (g_verbose)
 	  cout << "unlocked!" << endl;
@@ -523,8 +664,8 @@ void stash_results (Request* thisreq, Device *pDev) {
 	
 	while (g_pLock) {
 	  // do nothing until lock is released
-	  if (g_verbose)
-	    cout << " waiting .. (camera_index=" << camera_index << ")";
+	  //	  if (g_verbose)
+	  //	    cout << " waiting .. (camera_index=" << camera_index << ")";
 	  usleep(30);
 	}
 	g_pLock=1;
@@ -545,6 +686,10 @@ void stash_results (Request* thisreq, Device *pDev) {
 	if (camera_index==0) {
 	  // make a copy of the data and unlock for other camera threads to proceed
 	  unsigned int* mosaic_copy=(unsigned int*)malloc(g_mosaicNX*g_mosaicNY*sizeof(unsigned int));
+	  if (mosaic_copy==NULL) {
+	    cout <<"can't allocate! mosaic_copy -- exiting."<<endl; 
+	    exit(1);
+	  }
 	  memcpy(mosaic_copy,g_pMosaic,g_mosaicNX*g_mosaicNY*sizeof(unsigned int));
 	  g_pLock=0;
 	  // unfinished business of saving the fits file and freeing up the copy image.
@@ -566,6 +711,7 @@ void stash_results (Request* thisreq, Device *pDev) {
 	  fits_close_file(ff,&status);
 	  if (status) fits_report_error(status);
 	  free(mosaic_copy);
+	  mosaic_copy=NULL;
 	} else {
 	  // if other camera_index, done with contributing to g_pMosaic
 	  g_pLock=0;
@@ -699,17 +845,26 @@ void stash_results (Request* thisreq, Device *pDev) {
       // this time decimated by g_save_rebin x g_save_rebin for smaller size
 
       char outfile_rebin[1024];
-
+      void *pData_rebin;
+      int status=0;
+      fitsfile *ff;
+      long naxis=2;
+      long naxes[]={(long)floor(iWidth/g_save_rebin),(long)floor(iHeight/g_save_rebin)};
+      
       if (g_decimate) {
 	sprintf(outfile_rebin,"dat/BF_%s_dm%02d_%u_%u.fits",
 		ser.c_str(),g_save_rebin,ts,xt);
+	pData_rebin=(void*)malloc(naxes[0]*naxes[1]*sizeof(char));
       } else {
 	sprintf(outfile_rebin,"dat/BF_%s_rb%02d_%u_%u.fits",
 		ser.c_str(),g_save_rebin,ts,xt);
+	pData_rebin=(void*)malloc(naxes[0]*naxes[1]*sizeof(unsigned short));
       }
 
-      int status=0;
-      fitsfile *ff;
+      if (pData_rebin==NULL) {
+	cout << "can't allocate! pData_rebin -- exiting." << endl;
+	exit(1);
+      }
 
       if (g_verbose)
 	cout << " (" << outfile_rebin << ") " << endl;
@@ -717,19 +872,14 @@ void stash_results (Request* thisreq, Device *pDev) {
       fits_create_file(&ff,outfile_rebin,&status);
       if (status) fits_report_error(status);
 
-      long naxis=2;
-      long naxes[]={(long)floor(iWidth/g_save_rebin),(long)floor(iHeight/g_save_rebin)};
-
-      if (g_decimate) 
-	{
+      if (g_decimate) {
+	  // decimate, not rebin
 	  int ix=naxes[0]*naxes[1];
 	  int i,j;
-	  char *pData_rebin=
-	    (char*)malloc(naxes[0]*naxes[1]*sizeof(char));
 	  while (ix--) {
 	    i=(ix%naxes[0])*g_save_rebin;
 	    j=(ix/naxes[0])*g_save_rebin;
-	    pData_rebin[ix]=((char*)(pData))[j*iWidth+i];
+	    ((char*)pData_rebin)[ix]=((char*)(pData))[j*iWidth+i];
 	  }
 	  fits_create_img(ff,BYTE_IMG,naxis,naxes,&status);
 	  if (status) fits_report_error(status);
@@ -738,32 +888,29 @@ void stash_results (Request* thisreq, Device *pDev) {
 	  if (status) fits_report_error(status);
 	  fits_close_file(ff,&status);
 	  if (status) fits_report_error(status);
-	  free(pData_rebin);
+      } else {
+	// rebin, not decimate
+	int ix=naxes[0]*naxes[1];
+	while (ix--) ((unsigned short*)pData_rebin)[ix]=0;
+	ix=iWidth*iHeight;
+	while (ix--) {
+	  int i,j;
+	  i=(ix%iWidth)/g_save_rebin;
+	  j=(ix/iWidth)/g_save_rebin;
+	  ((unsigned short*)pData_rebin)[j*naxes[0]+i] += (0xFF & ((char*)(pData))[ix]);
 	}
-      if (!g_decimate)
-	{
-	  unsigned short *pData_rebin=
-	    (unsigned short*)malloc(naxes[0]*naxes[1]*
-				    sizeof(unsigned short));
-	  int ix=naxes[0]*naxes[1];
-	  while (ix--) pData_rebin[ix]=0;
-	  ix=iWidth*iHeight;
-	  while (ix--) {
-	    int i,j;
-	    i=(ix%iWidth)/g_save_rebin;
-	    j=(ix/iWidth)/g_save_rebin;
-	    //	    cout << "orig_x,y = " << ix%iWidth << "," << ix/iWidth << "rebin_x,y = " << i << "," << j << endl;
-	    pData_rebin[j*naxes[0]+i] += (0xFF & ((char*)(pData))[ix]);
-	  }
-	  fits_create_img(ff,USHORT_IMG,naxis,naxes,&status);
-	  if (status) fits_report_error(status);
-	  fits_write_img(ff,TUSHORT,1,naxes[0]*naxes[1],
-			 (void*)pData_rebin,&status);
-	  if (status) fits_report_error(status);
-	  fits_close_file(ff,&status);
-	  if (status) fits_report_error(status);
-	  free(pData_rebin);
-	}
+	fits_create_img(ff,USHORT_IMG,naxis,naxes,&status);
+	if (status) fits_report_error(status);
+	fits_write_img(ff,TUSHORT,1,naxes[0]*naxes[1],
+		       (void*)pData_rebin,&status);
+	if (status) fits_report_error(status);
+	fits_close_file(ff,&status);
+	if (status) fits_report_error(status);
+      }
+      if (g_verbose)
+	cout << "about to free pData_rebin " << (void*)pData_rebin << endl;
+      free(pData_rebin);
+      pData_rebin=NULL;
     }
     // finally compute rois on pData
     {
@@ -773,7 +920,7 @@ void stash_results (Request* thisreq, Device *pDev) {
       // "fitsh" a single element fits list (be sure to deallocate after use)
       int camera_index=g_ncameras;
       while (camera_index-- && strcmp(g_serials[camera_index],pDev->serial.read().c_str()));
-
+      camera_index=g_device_map[camera_index];
       fits *fitsh=NULL;
       append_fits_request(&fitsh,outfile,thisreq); 
       compute_roi_fits_request(g_roih,fitsh,camera_index);
@@ -781,7 +928,6 @@ void stash_results (Request* thisreq, Device *pDev) {
     }
   }
 }
-
 
 void compute_roi_fits_request(roi *r,fits *f,int cix) {
   // allocate and deallocate anything within the roi & fits chains. 
@@ -806,8 +952,12 @@ void compute_roi_fits_request(roi *r,fits *f,int cix) {
     int roi_ix;
     n_fits++;
     fp->m_info.n_px=n_roi;
-    if (fp->m_info.px == NULL)
+    if (fp->m_info.px == NULL) 
       fp->m_info.px=(proj_x*)malloc(fp->m_info.n_px*sizeof(proj_x));
+    if (fp->m_info.px==NULL) {
+      cout << "can't allocate! fp->m_info.px -- exiting." << endl;
+      exit(1);
+    }
 
     rp=r;
     roi_ix=0;
@@ -825,7 +975,6 @@ void compute_roi_fits_request(roi *r,fits *f,int cix) {
   if (g_verbose)
     cout << "n_roi " << n_roi << " n_fits " << n_fits << endl;
   // do work
-  // BLAH BLAH BLAH
   // deallocate
   fp=f;
   while (fp!=NULL) {
@@ -836,7 +985,7 @@ void compute_roi_fits_request(roi *r,fits *f,int cix) {
       if (g_verbose)
 	cout << "this " << cix << " has n_px = " << fp->m_info.n_px << endl;
       for (roi_ix=0;roi_ix<fp->m_info.n_px;roi_ix++) {
-	// do nothing
+	// do nothing, already deallocated
       }
       free(fp->m_info.px);
       fp->m_info.px=NULL;
@@ -847,6 +996,10 @@ void compute_roi_fits_request(roi *r,fits *f,int cix) {
 
 void append_roi (roi **r,char *roispec) {
   roi *new_roi=(roi*)malloc(sizeof(roi));
+  if (new_roi==NULL) {
+    cout << "can't allocate! new_roi -- exiting." << endl; 
+    exit(1);
+  }
 
   int n_parse=sscanf(roispec,"%d,%f:%f,%f:%f,%f",
 		     &new_roi->camera_index,
@@ -889,11 +1042,16 @@ void destroy_fits_request (fits **f) {
     fits *fp=*f;
     *f=(*f)->next_fits;
     free(fp);
+    fp=NULL;
   }
 }
 
 void append_fits_request (fits **f,char *name,Request *thisreq) {
   fits *new_fits=(fits*)malloc(sizeof(fits));
+  if (new_fits==NULL) {
+    cout << "can't allocate! new_fits -- exiting." << endl; 
+    exit(1);
+  }
   new_fits->filename=name;
   new_fits->m_info.px=NULL;
   // copy the map over from the request (already in memory)
@@ -937,33 +1095,26 @@ void compute_roi(roi *rp,fits *fp,int roi_ix) {
   // actually use the intended center, that's where this needs to rotate about
   x_c=(x0+x1)/2.0;
   y_c=(y0+y1)/2.0;
+
   // find the limits (in pixels) when the roi is rotated as prescribed
   float corners[][2]={{(float)(x_s-0.5),(float)(y_s-0.5)},
 		      {(float)(x_f+0.5),(float)(y_f+0.5)}};
-  float corner_radii[]={(float)sqrt(pow(corners[0][0]-x_c,2)+
-				    pow(corners[0][1]-y_c,2)),
-			(float)sqrt(pow(corners[0][0]-x_c,2)+
-				    pow(corners[1][1]-y_c,2)),
-			(float)sqrt(pow(corners[1][0]-x_c,2)+
-				    pow(corners[0][1]-y_c,2)),
-			(float)sqrt(pow(corners[1][0]-x_c,2)+
-				    pow(corners[1][1]-y_c,2))};
 
-  float corner_phi[]={(float)atan2(corners[0][1]-y_c,
-				   corners[0][0]-x_c),
-		      (float)atan2(corners[1][1]-y_c,
-				   corners[0][0]-x_c),
-		      (float)atan2(corners[0][1]-y_c,
-				   corners[1][0]-x_c),
-		      (float)atan2(corners[1][1]-y_c,
-				   corners[1][0]-x_c)};
+  float corner_radii[]={(float)sqrt(pow(corners[0][0]-x_c,2)+pow(corners[0][1]-y_c,2)),
+			(float)sqrt(pow(corners[0][0]-x_c,2)+pow(corners[1][1]-y_c,2)),
+			(float)sqrt(pow(corners[1][0]-x_c,2)+pow(corners[0][1]-y_c,2)),
+			(float)sqrt(pow(corners[1][0]-x_c,2)+pow(corners[1][1]-y_c,2))};
+
+  float corner_phi[]={(float)atan2(corners[0][1]-y_c,corners[0][0]-x_c),
+		      (float)atan2(corners[1][1]-y_c,corners[0][0]-x_c),
+		      (float)atan2(corners[0][1]-y_c,corners[1][0]-x_c),
+		      (float)atan2(corners[1][1]-y_c,corners[1][0]-x_c)};
 
   float deg=atan2(1,1)/45.0;
-  float projected_x_coords[]={
-    (float)(corner_radii[0]*cos(theta*deg-corner_phi[0])),
-    (float)(corner_radii[1]*cos(theta*deg-corner_phi[1])),
-    (float)(corner_radii[2]*cos(theta*deg-corner_phi[2])),
-    (float)(corner_radii[3]*cos(theta*deg-corner_phi[3]))};
+  float projected_x_coords[]={(float)(corner_radii[0]*cos(theta*deg-corner_phi[0])),
+			      (float)(corner_radii[1]*cos(theta*deg-corner_phi[1])),
+			      (float)(corner_radii[2]*cos(theta*deg-corner_phi[2])),
+			      (float)(corner_radii[3]*cos(theta*deg-corner_phi[3]))};
   float cs=cos(theta*deg);
   float sn=sin(theta*deg);
 
@@ -988,12 +1139,28 @@ void compute_roi(roi *rp,fits *fp,int roi_ix) {
 
   int *proj_x_hist=fp->m_info.px[roi_ix].proj_x_hist=
     (int*)malloc(n_bin*sizeof(int));
+  if (proj_x_hist==NULL) {
+    cout << "can't allocate! proj_x_hist -- exiting." << endl; 
+    exit(1);
+  }
   int *proj_x_npix=fp->m_info.px[roi_ix].proj_x_npix=
     (int*)malloc(n_bin*sizeof(int));
+  if (proj_x_npix==NULL) {
+    cout << "can't allocate! proj_x_npix -- exiting." << endl; 
+    exit(1);
+  }
   float *proj_x_coord=fp->m_info.px[roi_ix].proj_x_coord=
     (float*)malloc(n_bin*sizeof(float));
+  if (proj_x_coord==NULL) {
+    cout << "can't allocate! proj_x_coord -- exiting." << endl; 
+    exit(1);
+  }
   float *proj_x_density=fp->m_info.px[roi_ix].proj_x_density=
     (float*)malloc(n_bin*sizeof(float));
+  if (proj_x_density==NULL) {
+    cout << "can't allocate! proj_x_density -- exiting." << endl;
+    exit(1);
+  }
       
   { // initialize.
     int b=n_bin;
